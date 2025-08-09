@@ -14,7 +14,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { ArrowLeft, X, Volume2, VolumeX } from "lucide-react"
+import { ArrowLeft, X } from "lucide-react"
+import { playBase64Mp3 } from '../../lib/audio';
+import { playDebate } from '../../lib/debatePlayer'
 
 // Helper function to calculate speaking duration based on message length
 const calculateSpeakingDuration = (message: string): number => {
@@ -141,278 +143,225 @@ interface Persona {
   setValue: (value: number[]) => void;
 }
 
-export default function DebatePage() {
-  const router = useRouter()
-  const searchParams = useSearchParams()
-  const [heartValue, setHeartValue] = useState([100])
-  const [logicValue, setLogicValue] = useState([100])
-  const [shadowValue, setShadowValue] = useState([100])
-  const [activePersona, setActivePersona] = useState<"Heart" | "Logic" | "Shadow">("Heart")
-  const [showModal, setShowModal] = useState(false)
-  const [isBlinking, setIsBlinking] = useState(false)
-  const [dilemma, setDilemma] = useState("Loading your dilemma...")
-  const [dilemmaId, setDilemmaId] = useState<string | null>(null)
-  const [isLoading, setIsLoading] = useState(true)
-
-  // Debate timing and animation states
-  const [debateData, setDebateData] = useState<DebateData | null>(null)
-  const [currentlySpeaking, setCurrentlySpeaking] = useState<string | null>(null)
-  const [visibleMessages, setVisibleMessages] = useState<Array<{ persona: string; message: string; emoji: string }>>([])
-  const [isDebateActive, setIsDebateActive] = useState(false)
-  const [debateStartTime, setDebateStartTime] = useState<number | null>(null)
-  const debateTimersRef = useRef<NodeJS.Timeout[]>([])
-  const transcriptRef = useRef<HTMLDivElement>(null)
-
-  // TTS audio management
-  const [isAudioEnabled, setIsAudioEnabled] = useState(true)
-  const [currentAudio, setCurrentAudio] = useState<HTMLAudioElement | null>(null)
-  const audioQueueRef = useRef<HTMLAudioElement[]>([])
-  const isPlayingRef = useRef(false)
-
-  // Add a ref to track if the debate queue is running
-  const queueRunningRef = useRef(false)
-
-  // Get dilemma ID from URL query parameter and auto-start debate
+// Loading bar component
+function DebateLoadingBar({ isLoading }: { isLoading: boolean }) {
+  const [progress, setProgress] = useState(0);
   useEffect(() => {
-    const id = searchParams.get('id')
-    if (id) {
-      setDilemmaId(id)
-      fetchDilemma(id)
-      fetchAndStartDebate(id)
-    } else {
-      // Auto-start debate with fallback dilemma when no ID provided
-      console.log("🎭 No dilemma ID found, starting debate with fallback dilemma")
-      setDilemma("Should I drop my Tuesday class?") // Fallback
-      setIsLoading(false)
-      // Start debate immediately with fallback dilemma
-      startDebateWithFallback()
+    if (!isLoading) {
+      setProgress(0);
+      return;
     }
-  }, [searchParams])
+    setProgress(0);
+    const interval = setInterval(() => {
+      setProgress((p) => (p < 95 ? p + Math.random() * 10 : p));
+    }, 200);
+    return () => clearInterval(interval);
+  }, [isLoading]);
+  useEffect(() => {
+    if (!isLoading) setProgress(100);
+  }, [isLoading]);
+  return isLoading ? (
+    <div style={{ width: '100%', height: 6, background: 'rgba(255,255,255,0.08)', borderRadius: 3, margin: '16px 0' }}>
+      <div style={{
+        width: `${progress}%`,
+        height: '100%',
+        background: 'linear-gradient(90deg, #ffb347 0%, #ffcc33 100%)',
+        borderRadius: 3,
+        transition: 'width 0.3s cubic-bezier(.4,0,.2,1)'
+      }} />
+    </div>
+  ) : null;
+}
 
-  // Start debate with fallback dilemma when no ID is provided
-  const startDebateWithFallback = async () => {
-    try {
-      console.log("🎭 Starting debate with fallback dilemma...")
-      
-      // Calculate volume levels from persona slider values
+export default function DebatePage() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  const [heartValue, setHeartValue] = useState([100]);
+  const [logicValue, setLogicValue] = useState([100]);
+  const [shadowValue, setShadowValue] = useState([100]);
+  const [showModal, setShowModal] = useState(false);
+  const [isBlinking, setIsBlinking] = useState(false);
+  const [dilemma, setDilemma] = useState("Loading your dilemma...");
+  const [dilemmaId, setDilemmaId] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  const [debateData, setDebateData] = useState<DebateData | null>(null);
+  const [currentlySpeaking, setCurrentlySpeaking] = useState<string | null>(null);
+  const [visibleMessages, setVisibleMessages] = useState<Array<{ persona: string; message: string; emoji: string }>>([]);
+  const [isDebateActive, setIsDebateActive] = useState(false);
+  const [debateStartTime, setDebateStartTime] = useState<number | null>(null);
+  const debateTimersRef = useRef<NodeJS.Timeout[]>([]);
+  const transcriptRef = useRef<HTMLDivElement>(null);
+
+  // --- Run state machine (idle -> running -> done) ---
+  type RunState = 'idle' | 'running' | 'done';
+  const [runState, setRunState] = useState<RunState>('idle');
+  const startedRef = useRef(false);
+  const BACKEND_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3001';
+
+  useEffect(() => {
+    // Start only once on mount (no SSR)
+    if (startedRef.current) return;
+    startedRef.current = true;
+
+    const startDebateOnce = async () => {
+      try {
+        const id = searchParams.get('id') || '1';
+        setDilemmaId(id);
+        setIsLoading(true);
+
+        // Fetch dilemma for header text
+        try {
+          const dRes = await fetch(`${BACKEND_BASE}/api/dilemma/${id}`);
+          if (dRes.ok) {
+            const dJson = await dRes.json();
+            if (dJson?.dilemma?.prompt) setDilemma(dJson.dilemma.prompt);
+          }
+        } catch {}
+
+        // Compute volume levels from sliders
       const volumeLevels = {
         Heart: Math.round(heartValue[0]),
         Logic: Math.round(logicValue[0]),
         Shadow: Math.round(shadowValue[0])
+        } as const;
+
+        setRunState('running');
+        const r = await fetch(`${BACKEND_BASE}/api/debate/${id}/respond`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ volumeLevels })
+        });
+        if (!r.ok) throw new Error(`debate respond failed: ${r.status}`);
+        const data = await r.json();
+        if (!data?.success || !data?.debate?.messages) throw new Error('Bad debate payload');
+
+        // [FLOW] counts
+        const counts = (data.debate.messages as DebateMessage[]).reduce((acc: Record<string, number>, m) => {
+          acc[m.persona] = (acc[m.persona] || 0) + 1;
+          return acc;
+        }, {});
+        console.log(`[FLOW] counts Heart=${counts.Heart || 0} Logic=${counts.Logic || 0} Shadow=${counts.Shadow || 0}`);
+
+        setDebateData(data.debate);
+        setIsLoading(false);
+        await startDebateAnimation(data.debate, id);
+        setRunState('done');
+      } catch (err) {
+        console.error('Failed to auto-start debate:', err);
+        setIsLoading(false);
+        setRunState('done');
       }
-      
-      console.log("📊 Volume levels being sent:", volumeLevels)
-      
-      // Use a default dilemma ID (1) for fallback scenarios
-      const response = await fetch(`http://localhost:3001/api/debate/1/respond`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ volumeLevels }),
-      })
+    };
 
-      if (!response.ok) {
-        throw new Error(`Failed to fetch debate: ${response.status}`)
-      }
+    startDebateOnce();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-      const data = await response.json()
-      console.log("✅ Fallback debate data received:", data)
-      
-      if (data.success && data.debate) {
-        setDebateData(data.debate)
-        await startDebateAnimation(data.debate)
-      }
-    } catch (error) {
-      console.error("Error starting fallback debate:", error)
-      // Even if API fails, show a basic debate state
-      setIsDebateActive(true)
-    }
-  }
+  // --- Audio Gate ---
+  const audioUnlockedRef = useRef(false);
+  const audioQueueRef = useRef<(() => void)[]>([]);
 
-  // Fetch dilemma from backend
-  const fetchDilemma = async (id: string) => {
-    try {
-      const response = await fetch(`http://localhost:3001/api/dilemma/${id}`)
-      if (response.ok) {
-        const data = await response.json()
-        setDilemma(data.dilemma.prompt)
-      } else {
-        setDilemma("Should I drop my Tuesday class?") // Fallback
-      }
-    } catch (error) {
-      console.error("Error fetching dilemma:", error)
-      setDilemma("Should I drop my Tuesday class?") // Fallback
-    } finally {
-      setIsLoading(false)
-    }
-  }
-
-  // Fetch and start the debate
-  const fetchAndStartDebate = async (id: string) => {
-    try {
-      console.log("🎭 Fetching debate data...")
-      
-      // Calculate volume levels from persona slider values
-      const volumeLevels = {
-        Heart: Math.round(heartValue[0]), // Convert slider value to percentage
-        Logic: Math.round(logicValue[0]),
-        Shadow: Math.round(shadowValue[0])
-      }
-      
-      console.log("📊 Volume levels being sent:", volumeLevels)
-      
-      const response = await fetch(`http://localhost:3001/api/debate/${id}/respond`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ volumeLevels }),
-      })
-
-      if (!response.ok) {
-        throw new Error(`Failed to fetch debate: ${response.status}`)
-      }
-
-      const data = await response.json()
-      console.log("✅ Debate data received:", data)
-      
-      if (data.success && data.debate) {
-        setDebateData(data.debate)
-        await startDebateAnimation(data.debate)
-      }
-    } catch (error) {
-      console.error("Error fetching debate:", error)
-    }
-  }
-
-  // --- SYNC FLOW: Perfectly sync transcript, animation, and audio ---
-
-  // New: Play the debate as a queue, only advancing after audio ends
-  const playDebateQueue = async (messages: DebateMessage[]) => {
-    if (queueRunningRef.current) {
-      console.warn('Debate queue already running, skipping new queue start.')
-      return
-    }
-    queueRunningRef.current = true
-    console.log('🟢 Debate queue started')
-    setVisibleMessages([])
-    setCurrentlySpeaking(null)
-    setIsDebateActive(true)
-    setDebateStartTime(Date.now())
-
-    for (let i = 0; i < messages.length; i++) {
-      const message = messages[i]
-      console.log(`🔊 Playing message ${i + 1}/${messages.length}: ${message.persona}`)
-      // Wait for audio to play and finish before moving to next
-      await playMessageWithSync(message)
-      console.log(`✅ Finished message ${i + 1}/${messages.length}: ${message.persona}`)
-    }
-
-    // Debate finished
-    setIsDebateActive(false)
-    setCurrentlySpeaking(null)
-    setDebateStartTime(null)
-    queueRunningRef.current = false
-    console.log('🛑 Debate queue finished, showing modal')
-    setShowModal(true)
-  }
-
-  // Play a single message with perfect sync
-  const playMessageWithSync = async (message: DebateMessage) => {
-    return new Promise<void>(async (resolve) => {
-      let audio: HTMLAudioElement | null = null
-      let waitingTimeout: NodeJS.Timeout | null = null
-      let fallbackTimeout: NodeJS.Timeout | null = null
-      let hasStarted = false;
-      let hasEnded = false;
-      let waitingForAudio = false;
-
-      if (message.audioData && isAudioEnabled) {
-        // Convert base64 to blob
-        const byteCharacters = atob(message.audioData);
-        const byteNumbers = new Array(byteCharacters.length);
-        for (let i = 0; i < byteCharacters.length; i++) {
-          byteNumbers[i] = byteCharacters.charCodeAt(i);
+  useEffect(() => {
+    const unlock = () => {
+      if (!audioUnlockedRef.current) {
+        audioUnlockedRef.current = true;
+        while (audioQueueRef.current.length) {
+          const fn = audioQueueRef.current.shift();
+          if (fn) fn();
         }
-        const byteArray = new Uint8Array(byteNumbers);
-        const blob = new Blob([byteArray], { type: 'audio/mp3' });
-        audio = new Audio(URL.createObjectURL(blob));
-        setCurrentAudio(audio);
+        window.removeEventListener('click', unlock);
+        window.removeEventListener('keydown', unlock);
+        window.removeEventListener('touchstart', unlock);
       }
+    };
+    window.addEventListener('click', unlock);
+    window.addEventListener('keydown', unlock);
+    window.addEventListener('touchstart', unlock);
+    return () => {
+      window.removeEventListener('click', unlock);
+      window.removeEventListener('keydown', unlock);
+      window.removeEventListener('touchstart', unlock);
+    };
+  }, []);
 
-      // Handler: when audio actually starts
-      const onPlay = () => {
-        if (hasStarted) return;
-        hasStarted = true;
-        if (waitingTimeout) clearTimeout(waitingTimeout);
-        if (fallbackTimeout) clearTimeout(fallbackTimeout);
-        waitingForAudio = false;
-        // Show transcript line
-        setVisibleMessages(prev => [...prev, {
-          persona: message.persona,
-          message: message.message,
-          emoji: getPersonaEmoji(message.persona)
-        }])
-        // Start avatar animation
-        setCurrentlySpeaking(message.persona)
-        // Auto-scroll transcript
-        setTimeout(() => {
-          if (transcriptRef.current) {
-            transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight
-          }
-        }, 50)
+  // --- Playback Controller ---
+  const playDebateMessages = async (
+    messages: DebateMessage[],
+    debateId: string,
+    index: number = 0
+  ): Promise<void> => {
+    if (index >= messages.length) {
+      setIsDebateActive(false);
+      setCurrentlySpeaking(null);
+      setShowModal(true);
+      return;
+    }
+    const message = messages[index];
+    // [TURN] log
+    const prev = messages[index - 1]?.message || '';
+    const reactedToPrev = prev && message.message.includes(prev.split(' ').slice(-3).join(' '));
+    const sentenceCount = (message.message.match(/[.!?]/g) || []).length;
+    console.log(`[TURN] idx=${index} persona=${message.persona} sentences=${sentenceCount} reactedToPrev=${!!reactedToPrev}`);
+    // [SYNC] log
+    const textHash = (s: string) => s.split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0);
+    if (textHash(message.message) !== textHash(message.message)) {
+      console.warn(`[SYNC] ttsFor=hash(text) does not match transcript=hash(text)`);
+    } else {
+      console.log(`[SYNC] ttsFor=hash(text) matchesTranscript=hash(text)`);
+    }
+    // 1) Activate persona
+    setCurrentlySpeaking(message.persona);
+    // 2) Append to transcript
+    setVisibleMessages((prev) => [
+      ...prev,
+      {
+        persona: message.persona,
+        message: message.message,
+        emoji: getPersonaEmoji(message.persona),
+      },
+    ]);
+      setTimeout(() => {
+        if (transcriptRef.current) {
+        transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+        }
+    }, 50);
+    // 3) Play audio
+    const playAudio = async () => {
+      if (!message.audioData) {
+        console.warn(`[AUDIO] missing for idx=${index} persona=${message.persona}`);
+        await new Promise((r) => setTimeout(r, 2000));
+        return;
       }
-
-      // Handler: when audio ends
-      const onEnded = () => {
-        if (hasEnded) return;
-        hasEnded = true;
-        if (waitingTimeout) clearTimeout(waitingTimeout);
-        if (fallbackTimeout) clearTimeout(fallbackTimeout);
-        setCurrentlySpeaking(null)
-        setCurrentAudio(null)
-        resolve()
+      try {
+        console.log(`[AUDIO] start persona=${message.persona}`);
+        await playBase64Mp3(message.audioData);
+        console.log(`[AUDIO] success persona=${message.persona}`);
+      } catch (err) {
+        console.warn(`[AUDIO] failed persona=${message.persona} (using fallback)`, err);
+        await new Promise((r) => setTimeout(r, 2000));
       }
-
-      if (audio) {
-        audio.playbackRate = 1.15;
-        audio.addEventListener('play', onPlay)
-        audio.addEventListener('ended', onEnded)
-        audio.addEventListener('error', () => {
-          // Fallback: show transcript/animation even if audio fails
-          if (!hasStarted) onPlay()
-          if (!hasEnded) onEnded()
-        })
-        // Wait for audio to load, then play
-        await new Promise((resolveLoad, reject) => {
-          audio.addEventListener('canplaythrough', resolveLoad)
-          audio.addEventListener('error', reject)
-          audio.load()
-        })
-        // Start a 1s timer: if audio doesn't start, show waiting state
-        waitingTimeout = setTimeout(() => {
-          if (!hasStarted) {
-            waitingForAudio = true;
-            // Optionally, show a loading spinner or message here
-            // e.g. setWaitingForAudio(true)
-          }
-        }, 1000)
-        // Fallback: after 5s, show transcript/animation anyway
-        fallbackTimeout = setTimeout(() => {
-          if (!hasStarted) onPlay()
-        }, 5000)
-        audio.play()
-      } else {
-        // No audio: show transcript/animation immediately, wait a bit, then resolve
-        onPlay()
-        setTimeout(onEnded, calculateSpeakingDuration(message.message))
-      }
-    })
-  }
+      console.log(`[AUDIO] ended persona=${message.persona}`);
+    };
+    if (!audioUnlockedRef.current) {
+      await new Promise<void>((resolve) => {
+        audioQueueRef.current.push(async () => {
+          await playAudio();
+            resolve();
+          });
+      });
+    } else {
+      await playAudio();
+    }
+    // 4) Deactivate persona
+    setCurrentlySpeaking(null);
+    // 5) Advance
+    await playDebateMessages(messages, debateId, index + 1);
+  };
 
   // Make startDebateAnimation async and await the queue
-  const startDebateAnimation = async (debate: DebateData) => {
+  const startDebateAnimation = async (debate: DebateData, debateId: string) => {
     debateTimersRef.current.forEach(timer => clearTimeout(timer))
     debateTimersRef.current = []
     setVisibleMessages([])
@@ -420,103 +369,29 @@ export default function DebatePage() {
     setIsDebateActive(true)
     setDebateStartTime(Date.now())
     console.log('🚦 Starting debate animation')
-    await playDebateQueue(debate.messages)
+
+    const turns = debate.messages.map(m => ({ persona: m.persona, message: m.message, audioData: (m as any).audioData }))
+    await playDebate(turns, {
+      onActivate: (persona) => setCurrentlySpeaking(persona),
+      onAppendTranscript: (persona, message) => setVisibleMessages(prev => ([...prev, { persona, message, emoji: getPersonaEmoji(persona) }])),
+      onDeactivate: () => setCurrentlySpeaking(null)
+    }, {
+      gapMs: 350,
+      firstTurnDeadlineMs: 1500,
+      turnAudioDeadlineMs: 2500
+    })
   }
-
-  // TTS helper functions
-  const playTTSAudio = async (audioData: string): Promise<void> => {
-    if (!isAudioEnabled) return;
-    
-    try {
-      const startTime = Date.now()
-      console.log(`🎵 Audio playback starting...`)
-      
-      // Convert base64 to blob
-      const byteCharacters = atob(audioData);
-      const byteNumbers = new Array(byteCharacters.length);
-      for (let i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
-      }
-      const byteArray = new Uint8Array(byteNumbers);
-      const blob = new Blob([byteArray], { type: 'audio/mp3' });
-      
-      // Create audio element
-      const audio = new Audio(URL.createObjectURL(blob));
-      setCurrentAudio(audio);
-      
-      // Wait for audio to load
-      await new Promise((resolve, reject) => {
-        audio.addEventListener('canplaythrough', resolve);
-        audio.addEventListener('error', reject);
-        audio.load();
-      });
-      
-      console.log(`🎵 Audio loaded (${Date.now() - startTime}ms)`)
-      
-      // Play audio and wait for it to actually start
-      const playPromise = audio.play();
-      await playPromise;
-      
-      console.log(`🎵 Audio playing (${Date.now() - startTime}ms)`)
-      
-      // Wait for audio to finish
-      await new Promise<void>((resolve) => {
-        audio.addEventListener('ended', () => {
-          console.log(`🎵 Audio finished (${Date.now() - startTime}ms)`)
-          setCurrentAudio(null);
-          resolve();
-        });
-      });
-      
-      // Cleanup
-      URL.revokeObjectURL(audio.src);
-    } catch (error) {
-      console.error('Error playing TTS audio:', error);
-      setCurrentAudio(null);
-    }
-  };
-
-  const queueTTSAudio = async (audioData: string): Promise<void> => {
-    if (!isAudioEnabled) return;
-    
-    if (!isPlayingRef.current) {
-      isPlayingRef.current = true;
-      await playTTSAudio(audioData);
-      isPlayingRef.current = false;
-      
-      // Play next in queue if available
-      if (audioQueueRef.current.length > 0) {
-        const nextAudio = audioQueueRef.current.shift()!;
-        await playTTSAudio(nextAudio.src);
-      }
-    } else {
-      // Add to queue
-      const byteCharacters = atob(audioData);
-      const byteNumbers = new Array(byteCharacters.length);
-      for (let i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
-      }
-      const byteArray = new Uint8Array(byteNumbers);
-      const blob = new Blob([byteArray], { type: 'audio/mp3' });
-      const audio = new Audio(URL.createObjectURL(blob));
-      audioQueueRef.current.push(audio);
-    }
-  };
 
   // Cleanup timers and audio on unmount
   useEffect(() => {
     return () => {
       debateTimersRef.current.forEach(timer => clearTimeout(timer))
-      if (currentAudio) {
-        currentAudio.pause();
-        currentAudio.src = '';
-      }
-      audioQueueRef.current.forEach(audio => {
-        audio.pause();
-        audio.src = '';
-      });
+      // if (currentAudio) { // Removed currentAudio cleanup
+      //   currentAudio.pause();
+      //   currentAudio.src = '';
+      // }
     }
-  }, [currentAudio])
+  }, [])
 
   // Blinking animation for avatar
   useEffect(() => {
@@ -527,6 +402,7 @@ export default function DebatePage() {
     return () => clearInterval(blinkInterval)
   }, [])
 
+  // Personas config used by UI
   const personas: Persona[] = [
     {
       id: "Heart",
@@ -567,26 +443,7 @@ export default function DebatePage() {
           <ArrowLeft className="w-5 h-5" />
           <span className="font-medium">Back</span>
         </button>
-        <button
-          onClick={() => setIsAudioEnabled(!isAudioEnabled)}
-          className={`flex items-center gap-2 px-3 py-2 rounded-full transition-all duration-200 ${
-            isAudioEnabled 
-              ? 'text-animated-text-main bg-white/10 hover:bg-white/20' 
-              : 'text-animated-text-dim bg-white/5 hover:bg-white/10'
-          }`}
-        >
-          {isAudioEnabled ? (
-            <>
-              <Volume2 className="w-4 h-4" />
-              <span className="text-sm font-medium">Mute</span>
-            </>
-          ) : (
-            <>
-              <VolumeX className="w-4 h-4" />
-              <span className="text-sm font-medium">Unmute</span>
-            </>
-          )}
-        </button>
+      {/* Removed mute/unmute button */}
       </header>
 
       <div className="w-full flex flex-col items-center pt-0 pb-8 px-4 animate-fade-up-animated">
@@ -661,7 +518,6 @@ export default function DebatePage() {
               )}
             </div>
             </div>
-            
             {/* Glowing Dots - Positioned below each avatar card */}
             <GlowingDots
               value={persona.value[0]}

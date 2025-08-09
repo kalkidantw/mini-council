@@ -1,10 +1,15 @@
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const OpenAI = require("openai");
 const { tokenTracker } = require("../token-tracker");
+const { synthesizeTTS } = require("../lib/tts");
+
+const VOICE_MAPPING = {
+  Heart: "nova",    // Warm, empathetic, feminine
+  Logic: "coral",   // Clear, feminine, soprano
+  Shadow: "shimmer" // Mysterious, soothing, feminine
+};
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  fetch
+  apiKey: process.env.OPENAI_API_KEY
 });
 
 // Persona definitions with distinct personalities
@@ -58,7 +63,10 @@ Always stay true to your skeptical, self-protective nature. React naturally to w
 };
 
 // --- Debate Flow Parameters ---
-const TOTAL_MESSAGES = 11; // Always generate exactly 11 messages
+const MIN_MESSAGES = 9; // Minimum number of debate messages
+const MAX_MESSAGES = 11; // Maximum number of debate messages
+const MIN_TURNS_PER_PERSONA = 3;
+const MAX_TURNS_PER_PERSONA = 4;
 const MAX_DEBATE_TIME = 80; // Cap at 80 seconds
 const MAX_TOKENS_PER_MESSAGE = 60; // Increased for complete sentences
 const MAX_RETRIES_PER_MESSAGE = 2; // Retry on empty/failed message
@@ -90,12 +98,12 @@ async function generatePersonaDebate(dilemmaPrompt, volumeLevels = { Heart: 100,
     };
   }
 
-  // Randomly choose who speaks first from active personas
+  // Strict turn count enforcement
   const turnCount = { Heart: 0, Logic: 0, Shadow: 0 };
   const conversationHistory = [];
 
-  // Always generate exactly 11 messages
-  const totalMessages = TOTAL_MESSAGES;
+  // Decide total messages: randomly 9, 10, or 11
+  const totalMessages = Math.floor(Math.random() * (MAX_MESSAGES - MIN_MESSAGES + 1)) + MIN_MESSAGES;
   console.log(`🎯 Target: ${totalMessages} total messages for refined human-like reactive flow`);
 
   let attempts = 0;
@@ -104,17 +112,22 @@ async function generatePersonaDebate(dilemmaPrompt, volumeLevels = { Heart: 100,
   while (debateMessages.length < totalMessages && attempts < maxAttempts) {
     attempts++;
     const messageIndex = debateMessages.length;
-    // Dynamic, non-cyclic speaker selection
-    const nextSpeaker = determineNextSpeakerWithVolume(conversationHistory, turnCount, volumeLevels, messageIndex, activePersonas);
+    // Only allow personas who have not reached MAX_TURNS_PER_PERSONA
+    const eligiblePersonas = activePersonas.filter(p => turnCount[p] < MAX_TURNS_PER_PERSONA);
+    if (eligiblePersonas.length === 0) break; // All personas maxed out
+    // Dynamic, non-cyclic speaker selection, but only from eligible
+    const nextSpeaker = determineNextSpeakerWithVolume(conversationHistory, turnCount, volumeLevels, messageIndex, eligiblePersonas);
     if (!nextSpeaker) continue;
+    // Prevent any persona from exceeding MAX_TURNS_PER_PERSONA
+    if (turnCount[nextSpeaker] >= MAX_TURNS_PER_PERSONA) continue;
 
     // Build conversational context: last 1-2 messages
     const lastMsgs = conversationHistory.slice(-2).map(msg => msg.split(": ").slice(1).join(": ")).join("\n");
     let promptAddon = "";
     if (lastMsgs) {
-      promptAddon = `\nRespond directly to the previous point(s):\n${lastMsgs}\nChallenge, agree, or add a new perspective, but keep it conversational and brief (1–3 sentences).`;
+      promptAddon = `\nRespond directly to the previous point(s):\n${lastMsgs}\nChallenge, agree, or add a new perspective, but keep it conversational and brief. ABSOLUTELY NO MORE THAN TWO SHORT, NATURAL SENTENCES. Each sentence must be short and clear. Do not use compound sentences. Do not use filler or generic statements. Do not say you have nothing to add.`;
     } else {
-      promptAddon = "\nStart the debate with a brief, clear point (1–3 sentences).";
+      promptAddon = "\nStart the debate with a brief, clear point. ABSOLUTELY NO MORE THAN TWO SHORT, NATURAL SENTENCES. Each sentence must be short and clear. Do not use compound sentences. Do not use filler or generic statements.";
     }
 
     // Retry logic for empty/failed messages
@@ -129,24 +142,78 @@ async function generatePersonaDebate(dilemmaPrompt, volumeLevels = { Heart: 100,
       );
       if (message && message.message && message.message.trim().length > 0) break;
     }
-    // Fallback: if still no message, insert a generic short message
+    // If still no message, skip this turn (do NOT insert fallback)
     if (!message || !message.message || message.message.trim().length === 0) {
-      message = {
-        persona: nextSpeaker,
-        message: "I have nothing to add right now.",
-        timestamp: currentTime
-      };
+      continue;
+    }
+
+    // Enforce two short sentences max (split and trim)
+    let sentences = message.message.match(/[^.!?]+[.!?]+/g) || [message.message];
+    sentences = sentences.map(s => s.trim()).filter(Boolean).slice(0, 2);
+    message.message = sentences.join(' ');
+
+    // Synthesize TTS
+    const voiceId = VOICE_MAPPING[nextSpeaker];
+    const { base64, ms } = await synthesizeTTS(message.message, voiceId);
+    if (base64) {
+      message.audioData = base64;
+      message.ttsMs = ms;
+      console.log(`[SYNC] Text hash match for "${message.message}" (Voice: ${voiceId})`);
+    } else {
+      console.warn(`[SYNC] No audioData for "${message.message}" (Voice: ${voiceId})`);
     }
 
     debateMessages.push(message);
     conversationHistory.push(`${nextSpeaker}: ${message.message}`);
     turnCount[nextSpeaker]++;
-
     // Calculate speaking duration based on message length (natural reading speed)
     const speakingDuration = Math.ceil(message.message.length / 15); // ~15 chars/sec
     // Add natural pause between messages (0.5 to 1.2 seconds)
     const naturalPause = Math.random() * 0.7 + 0.5;
     currentTime = message.timestamp + speakingDuration + naturalPause;
+  }
+
+  // If any persona has fewer than MIN_TURNS_PER_PERSONA, pad with extra turns (if possible)
+  for (const persona of activePersonas) {
+    while (turnCount[persona] < MIN_TURNS_PER_PERSONA && debateMessages.length < MAX_MESSAGES) {
+      // Use last context for this persona
+      const lastMsgs = conversationHistory.slice(-2).map(msg => msg.split(": ").slice(1).join(": ")).join("\n");
+      let promptAddon = lastMsgs
+        ? `\nRespond directly to the previous point(s):\n${lastMsgs}\nChallenge, agree, or add a new perspective, but keep it conversational and brief. ABSOLUTELY NO MORE THAN TWO SHORT, NATURAL SENTENCES. Each sentence must be short and clear. Do not use compound sentences. Do not use filler or generic statements. Do not say you have nothing to add.`
+        : "\nAdd a brief, clear point. ABSOLUTELY NO MORE THAN TWO SHORT, NATURAL SENTENCES. Each sentence must be short and clear. Do not use compound sentences. Do not use filler or generic statements.";
+      let message = null;
+      for (let retry = 0; retry <= MAX_RETRIES_PER_MESSAGE; retry++) {
+        message = await generateNextMessageWithVolume(
+          dilemmaPrompt + promptAddon,
+          persona,
+          conversationHistory,
+          currentTime,
+          volumeLevels[persona]
+        );
+        if (message && message.message && message.message.trim().length > 0) break;
+      }
+      if (!message || !message.message || message.message.trim().length === 0) break;
+      let sentences = message.message.match(/[^.!?]+[.!?]+/g) || [message.message];
+      sentences = sentences.map(s => s.trim()).filter(Boolean).slice(0, 2);
+      message.message = sentences.join(' ');
+
+      // Synthesize TTS
+      const voiceId = VOICE_MAPPING[persona];
+      const { base64, ms } = await synthesizeTTS(message.message, voiceId);
+      if (base64) {
+        message.audioData = base64;
+        message.ttsMs = ms;
+        console.log(`[SYNC] Text hash match for "${message.message}" (Voice: ${voiceId})`);
+      } else {
+        console.warn(`[SYNC] No audioData for "${message.message}" (Voice: ${voiceId})`);
+      }
+      debateMessages.push(message);
+      conversationHistory.push(`${persona}: ${message.message}`);
+      turnCount[persona]++;
+      const speakingDuration = Math.ceil(message.message.length / 15);
+      const naturalPause = Math.random() * 0.7 + 0.5;
+      currentTime = message.timestamp + speakingDuration + naturalPause;
+    }
   }
 
   // Sort messages by timestamp to ensure proper order
@@ -177,92 +244,27 @@ async function generatePersonaDebate(dilemmaPrompt, volumeLevels = { Heart: 100,
 function determineNextSpeakerWithVolume(conversationHistory, turnCount, volumeLevels, messageIndex, activePersonas) {
   if (activePersonas.length === 0) return null;
   
-  // Get the last speaker and their message
+  // Get the last speaker
   const lastSpeaker = conversationHistory.length > 0 
     ? conversationHistory[conversationHistory.length - 1].split(':')[0]
     : null;
   
-  // Calculate participation weights based on volume levels and conversation flow
-  const participationWeights = {};
-  activePersonas.forEach(persona => {
-    const volume = volumeLevels[persona];
-    const turns = turnCount[persona];
-    
-    // Base weight directly from volume level (0-100% maps to 0-1 weight)
-    let weight = volume / 100;
-    
-    // Early conversation (first 3 turns): encourage all personas to participate
-    if (messageIndex < 3) {
-      const minTurns = Math.min(...Object.values(turnCount));
-      if (turns === minTurns) {
-        weight *= 2.0; // Strong boost for under-represented personas early on
-      }
-    }
-    
-    // Mid conversation (turns 4-8): prioritize natural reactions and responses
-    if (messageIndex >= 3 && messageIndex < 8) {
-      // 80% chance to respond to the last speaker for natural flow
-      if (lastSpeaker && persona !== lastSpeaker && Math.random() < 0.80) {
-        weight *= 1.8; // Strong boost for responding to others
-      }
-      
-      // Allow consecutive speaking (10% chance) for natural interruptions
-      if (persona === lastSpeaker && Math.random() < 0.10) {
-        weight *= 0.6; // Reduced but still possible for natural flow
-      }
-      
-      // Boost for fresh voices that haven't spoken recently
-      const recentSpeakers = conversationHistory.slice(-2).map(msg => msg.split(':')[0]);
-      if (!recentSpeakers.includes(persona)) {
-        weight *= 1.3; // Moderate boost for fresh perspective
-      }
-    }
-    
-    // Late conversation (turns 9+): encourage resolution and closure
-    if (messageIndex >= 8) {
-      // Encourage those who haven't spoken much to contribute to resolution
-      const minTurns = Math.min(...Object.values(turnCount));
-      if (turns === minTurns) {
-        weight *= 1.5; // Boost for under-represented personas
-      }
-      
-      // Allow natural follow-ups from the last speaker (5% chance)
-      if (persona === lastSpeaker && Math.random() < 0.05) {
-        weight *= 0.5; // Very reduced but still possible
-      }
-    }
-    
-    // Boost for contrasting perspectives (e.g., Heart vs Logic)
-    if (lastSpeaker) {
-      if ((persona === 'Heart' && lastSpeaker === 'Logic') || 
-          (persona === 'Logic' && lastSpeaker === 'Heart') ||
-          (persona === 'Shadow' && (lastSpeaker === 'Heart' || lastSpeaker === 'Logic'))) {
-        weight *= 1.2; // Boost for contrasting viewpoints
-      }
-    }
-    
-    // Ensure minimum participation weight (but respect volume levels)
-    participationWeights[persona] = Math.max(0.01, weight);
-  });
+  // Filter out the last speaker to prevent repeats
+  const eligiblePersonas = lastSpeaker
+    ? activePersonas.filter(p => p !== lastSpeaker && turnCount[p] < MAX_TURNS_PER_PERSONA)
+    : activePersonas.filter(p => turnCount[p] < MAX_TURNS_PER_PERSONA);
+
+  // If all others are maxed out, allow last speaker
+  const finalEligible = eligiblePersonas.length > 0 ? eligiblePersonas : activePersonas.filter(p => turnCount[p] < MAX_TURNS_PER_PERSONA);
+  if (finalEligible.length === 0) return null;
+
+  // Prefer personas with the fewest turns so far
+  const minTurns = Math.min(...finalEligible.map(p => turnCount[p]));
+  const leastUsed = finalEligible.filter(p => turnCount[p] === minTurns);
   
-  // Log participation weights for debugging
-  if (messageIndex === 0) {
-    console.log(`📊 Participation weights:`, participationWeights);
-  }
-  
-  // Select speaker based on weights
-  const totalWeight = Object.values(participationWeights).reduce((sum, weight) => sum + weight, 0);
-  let random = Math.random() * totalWeight;
-  
-  for (const persona of activePersonas) {
-    random -= participationWeights[persona];
-    if (random <= 0) {
-      return persona;
-    }
-  }
-  
-  // Fallback to random selection from active personas
-  return activePersonas[Math.floor(Math.random() * activePersonas.length)];
+  // Randomly pick among least used eligible personas
+  const nextSpeaker = leastUsed[Math.floor(Math.random() * leastUsed.length)];
+  return nextSpeaker;
 }
 
 /**

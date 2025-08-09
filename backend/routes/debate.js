@@ -1,15 +1,14 @@
 const express = require("express");
 const router = express.Router();
 const { generatePersonaDebate } = require("../services/debateEngine");
-const { generateTTSForMessages } = require("../services/ttsService");
 const { printTokenSummary } = require("../personas");
 const { createClient } = require("@supabase/supabase-js");
+const fs = require("fs");
+const path = require("path");
 
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const OpenAI = require("openai");
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  fetch
+  apiKey: process.env.OPENAI_API_KEY
 });
 
 const supabase = createClient(
@@ -20,116 +19,41 @@ const supabase = createClient(
 // POST /api/debate/:id/respond
 router.post("/:id/respond", async (req, res) => {
   try {
-    const { id: dilemmaId } = req.params;
-    const { volumeLevels } = req.body; // Extract volume levels from request body
-    
-    // Add logging for debugging
-    console.log(`Looking for dilemma with ID: ${dilemmaId}`);
-    console.log(`Request body:`, req.body);
-    console.log(`Volume levels:`, volumeLevels);
-
-    // 1. Fetch dilemma from Supabase with better error handling
-    const { data: dilemmaDataArray, error } = await supabase
+    const dilemmaId = req.params.id;
+    const { volumeLevels } = req.body;
+    // 1. Fetch dilemma prompt
+    const { data: dilemmaData, error: dilemmaError } = await supabase
       .from("Dilemmas")
-      .select("prompt, id")
-      .eq("id", dilemmaId.toString())
-      .limit(1);
-
-    // Log the query results
-    console.log('Supabase query result:', { data: dilemmaDataArray, error });
-
-    if (error) {
-      console.error('Supabase error:', error);
-      return res.status(500).json({ 
-        error: "Database error", 
-        details: error.message,
-        searchedId: dilemmaId 
-      });
+      .select("prompt")
+      .eq("id", dilemmaId)
+      .single();
+    if (dilemmaError || !dilemmaData) {
+      return res.status(404).json({ error: "Dilemma not found" });
     }
-
-    // Handle the array response
-    const dilemmaData = dilemmaDataArray?.[0];
-    
-    if (!dilemmaData) {
-      return res.status(404).json({ 
-        error: "Dilemma not found",
-        searchedId: dilemmaId 
-      });
-    }
-
-    console.log('Found dilemma:', dilemmaData);
-
     const prompt = dilemmaData.prompt;
-    
-    // 2. Generate the multi-turn debate with volume levels
-    console.log('🎭 Generating volume-controlled multi-turn debate...');
+    // 2. Generate the multi-turn debate (text only)
     const debateResult = await generatePersonaDebate(prompt, volumeLevels);
-    
-    console.log(`✅ Generated debate with ${debateResult.messages.length} messages`);
-    console.log(`📊 Total debate duration: ${debateResult.messages[debateResult.messages.length - 1]?.timestamp || 0} seconds`);
-
-    // 3. Generate TTS audio for all messages
-    console.log('🎤 Generating TTS audio for all messages...');
-    const messagesWithTTS = await generateTTSForMessages(debateResult.messages);
-    console.log(`✅ TTS generation completed for ${messagesWithTTS.length} messages`);
-
-    // Convert audio buffers to base64 for frontend consumption
-    const messagesWithAudioData = messagesWithTTS.map(msg => ({
-      persona: msg.persona,
-      message: msg.message,
-      timestamp: msg.timestamp,
-      audioData: msg.audioBuffer ? msg.audioBuffer.toString('base64') : null
-    }));
-
-    // 4. Save debate messages to Responses table
-    const savedMessages = [];
-    for (const message of debateResult.messages) {
-      try {
-        const { data: responseData, error: insertError } = await supabase
-          .from("Responses")
-          .insert([
-            {
-              dilemma_id: dilemmaId,
-              persona: message.persona,
-              transcript: message.message,
-              timestamp: new Date().toISOString(),
-              debate_timestamp: message.timestamp, // Store the debate timestamp
-            },
-          ])
-          .select();
-
-        if (insertError) {
-          console.error(`Error saving ${message.persona} message:`, insertError);
-        } else {
-          console.log(`✅ Saved ${message.persona} message at ${message.timestamp}s`);
-          savedMessages.push(responseData[0]);
-        }
-      } catch (saveError) {
-        console.error(`Error saving debate message:`, saveError);
-      }
-    }
-
-    // Print token usage summary
-    printTokenSummary();
-
-    res.json({ 
-      success: true, 
+    const messages = debateResult.messages;
+    // 3. Return transcript and message metadata immediately (no audio)
+    res.json({
+      success: true,
       debate: {
-        messages: messagesWithAudioData,
+        messages: messages.map((msg) => ({
+          persona: msg.persona,
+          message: msg.message,
+          timestamp: msg.timestamp,
+          audioData: msg.audioData,
+          ttsMs: msg.ttsMs,
+        })),
         conclusions: debateResult.conclusions,
-        totalDuration: debateResult.messages[debateResult.messages.length - 1]?.timestamp || 0
+        totalDuration: messages.length * 2, // Fixed 2s per message
       },
-      dilemmaId: dilemmaId,
-      dilemmaPrompt: prompt,
-      savedMessages: savedMessages.length
+      dilemmaId,
+      dilemmaPrompt: prompt
     });
-
   } catch (error) {
     console.error('Unexpected error in debate respond:', error);
-    res.status(500).json({ 
-      error: "Internal server error", 
-      details: error.message 
-    });
+    res.status(500).json({ error: "Internal server error", details: error.message });
   }
 });
 

@@ -1,18 +1,7 @@
 // server.js
 
-// Add fetch polyfill for Node.js < 18 - MUST be first!
-const fetch = require('node-fetch');
-const { Headers, Request, Response } = require('node-fetch');
-
-globalThis.fetch = fetch;
-globalThis.Headers = Headers;
-globalThis.Request = Request;
-globalThis.Response = Response;
-
-global.fetch = fetch;
-global.Headers = Headers;
-global.Request = Request;
-global.Response = Response;
+// Node.js v20+ has native fetch support - no polyfill needed
+console.log('🚀 Starting backend server with Node.js v20+ native fetch support');
 
 require("dotenv").config();
 const express = require("express");
