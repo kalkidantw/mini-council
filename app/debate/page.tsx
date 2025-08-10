@@ -198,7 +198,8 @@ export default function DebatePage() {
   type RunState = 'idle' | 'running' | 'done';
   const [runState, setRunState] = useState<RunState>('idle');
   const startedRef = useRef(false);
-  const BACKEND_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3001';
+  const BACKEND_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || '';
+
 
   useEffect(() => {
     // Start only once on mount (no SSR)
