@@ -20,7 +20,7 @@ export default function Component() {
     setIsSubmitting(true)
     
     try {
-      const response = await fetch("http://localhost:3001/api/dilemma", {
+      const response = await fetch("/api/dilemma", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
