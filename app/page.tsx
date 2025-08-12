@@ -20,7 +20,7 @@ export default function Component() {
     setIsSubmitting(true)
     
     try {
-      const response = await fetch("/api/dilemma", {
+      const response = await fetch("http://localhost:3001/api/dilemma", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -185,7 +185,7 @@ export default function Component() {
               Privacy
             </a>
           </div>
-          <p className="text-text-sub text-center text-sm">@2025 Mini Inner-Council : Split Yourself Into Stems. Kalkidan Wubshett</p>
+          <p className="text-text-sub text-center text-sm">@2025 Mini Inner-Council : Split Yourself Into Stems. Kalkidan Wubshet</p>
         </div>
       </footer>
     </div>
